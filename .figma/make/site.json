@@ -1,0 +1,10 @@
+{
+  "description": "Easily convert MP4 videos and YouTube links to MP3 audio files with this user-friendly web app, perfect for music lovers and content creators.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
