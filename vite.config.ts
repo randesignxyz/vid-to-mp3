@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 import { Readable } from 'node:stream'
-import ytdl from '@distube/ytdl-core'
+import { Innertube } from 'youtubei.js'
 
 import siteConfiguration from './.figma/make/site.json'
 
@@ -363,10 +363,28 @@ function figmaMakeKitPlugin(options: { storiesGlob: string | string[] }): Plugin
 }
 
 /**
+ * Helper to extract YouTube video ID from a URL.
+ */
+function getYouTubeVideoId(url: string): string | null {
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/
+  const match = url.match(regExp)
+  return match && match[2].length === 11 ? match[2] : null
+}
+
+/**
  * Custom local proxy server plugin to handle YouTube/URL audio extraction.
- * Uses @distube/ytdl-core for YouTube links, and proxies direct links.
+ * Uses youtubei.js for YouTube links, and proxies direct links.
  */
 function figmaYoutubeDownloadPlugin(): Plugin {
+  let youtubeClient: any = null
+
+  async function getYoutubeClient() {
+    if (!youtubeClient) {
+      youtubeClient = await Innertube.create()
+    }
+    return youtubeClient
+  }
+
   return {
     name: 'figma-youtube-download',
     apply: 'serve',
@@ -388,34 +406,42 @@ function figmaYoutubeDownloadPlugin(): Plugin {
         console.log(`[Proxy] Resolving URL: ${targetUrl}`)
 
         try {
-          // If it's a YouTube URL, use @distube/ytdl-core
-          if (ytdl.validateURL(targetUrl)) {
-            console.log('[Proxy] Detected YouTube link, using @distube/ytdl-core')
-            const info = await ytdl.getInfo(targetUrl)
-            const title = info.videoDetails.title || 'audio'
+          const videoId = getYouTubeVideoId(targetUrl)
+
+          // If it's a YouTube URL, use youtubei.js
+          if (videoId) {
+            console.log(`[Proxy] Detected YouTube link, videoId: ${videoId}. Fetching via youtubei.js...`)
+            
+            const youtube = await getYoutubeClient()
+            const info = await youtube.getBasicInfo(videoId)
+            const title = info.basic_info.title || 'audio'
             
             // Clean title for header (remove non-ASCII to prevent Content-Disposition issues)
             const safeTitle = title.replace(/[^\x20-\x7E]/g, '') || 'audio'
 
             console.log(`[Proxy] YouTube Video Title: ${title}`)
             
+            const format = info.chooseFormat({ type: 'audio', quality: 'best' })
+            const container = format.container || 'm4a'
+
             res.statusCode = 200
             res.setHeader('Content-Type', 'audio/mp4')
             res.setHeader(
               'Content-Disposition',
-              `attachment; filename="${encodeURIComponent(safeTitle)}.mp4"`
+              `attachment; filename="${encodeURIComponent(safeTitle)}.${container}"`
             )
 
-            const stream = ytdl(targetUrl, {
-              filter: 'audioonly',
-              quality: 'highestaudio',
+            const stream = await youtube.download(videoId, {
+              format: format,
+              type: 'audio'
             })
 
-            stream.on('error', (err: any) => {
-              console.error(`[Proxy] ytdl stream error: ${err.message}`)
-            })
-
-            stream.pipe(res)
+            // Stream standard Node.js piping or Web ReadableStream fallback
+            if (typeof (stream as any).pipe === 'function') {
+              (stream as any).pipe(res)
+            } else {
+              Readable.fromWeb(stream as any).pipe(res)
+            }
           } else {
             // Treat as direct video/audio stream URL
             console.log(`[Proxy] Detected direct URL, fetching stream directly: ${targetUrl}`)
