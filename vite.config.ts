@@ -2,6 +2,7 @@ import { defineConfig, type HtmlTagDescriptor, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 
 import siteConfiguration from './.figma/make/site.json'
 
@@ -23,6 +24,7 @@ export default defineConfig(({ mode }) => {
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
       figmaMakeKitPlugin({ storiesGlob: '/src/**/*.stories.{ts,tsx,js,jsx}' }),
+      figmaYoutubeDownloadPlugin(),
     ],
     resolve: {
       alias: {
@@ -356,5 +358,116 @@ function figmaMakeKitPlugin(options: { storiesGlob: string | string[] }): Plugin
         }
       })
     },
+  }
+}
+
+/**
+ * Custom local proxy server plugin to handle YouTube/URL audio extraction.
+ * Proxies requests to a public Cobalt instance and streams the response back.
+ */
+function figmaYoutubeDownloadPlugin(): Plugin {
+  const COBALT_INSTANCES = [
+    'https://api.cobalt.tools/',
+    'https://cobalt.api.ry.hu/',
+    'https://co.wuk.sh/'
+  ]
+
+  return {
+    name: 'figma-youtube-download',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        const urlObj = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`)
+        if (urlObj.pathname !== '/api/yt-download') {
+          return next()
+        }
+
+        const targetUrl = urlObj.searchParams.get('url')
+        if (!targetUrl) {
+          res.statusCode = 400
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: 'Missing url parameter' }))
+          return
+        }
+
+        console.log(`[Proxy] Resolving YouTube URL: ${targetUrl}`)
+
+        let downloadUrl = ''
+        let originalFilename = ''
+        let resolveError = ''
+
+        // Try instances in sequence
+        for (const instance of COBALT_INSTANCES) {
+          try {
+            const apiRes = await fetch(instance, {
+              method: 'POST',
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                url: targetUrl,
+                downloadMode: 'audio',
+                audioFormat: 'mp3',
+                filenamePattern: 'pretty'
+              })
+            })
+
+            if (!apiRes.ok) {
+              throw new Error(`Instance returned status ${apiRes.status}`)
+            }
+
+            const json = await apiRes.json() as any
+            if (json && json.url) {
+              downloadUrl = json.url
+              originalFilename = json.filename || 'audio.mp3'
+              break
+            } else {
+              throw new Error('Instance returned invalid response structure')
+            }
+          } catch (err: any) {
+            console.warn(`[Proxy] Instance ${instance} failed: ${err.message}`)
+            resolveError = err.message
+          }
+        }
+
+        if (!downloadUrl) {
+          res.statusCode = 502
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: `Failed to resolve video stream: ${resolveError}` }))
+          return
+        }
+
+        console.log(`[Proxy] Resolved stream URL: ${downloadUrl}`)
+        console.log(`[Proxy] Streaming file: ${originalFilename}`)
+
+        try {
+          const streamRes = await fetch(downloadUrl)
+          if (!streamRes.ok) {
+            throw new Error(`Failed to fetch file stream: status ${streamRes.status}`)
+          }
+
+          // Forward content type and content disposition
+          res.statusCode = 200
+          res.setHeader('Content-Type', streamRes.headers.get('content-type') || 'audio/mpeg')
+          res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${encodeURIComponent(originalFilename)}"`
+          )
+
+          const body = streamRes.body
+          if (body) {
+            Readable.fromWeb(body as any).pipe(res)
+          } else {
+            res.statusCode = 500
+            res.end(JSON.stringify({ error: 'No stream body available' }))
+          }
+        } catch (err: any) {
+          console.error(`[Proxy] Error streaming file: ${err.message}`)
+          res.statusCode = 500
+          res.end(JSON.stringify({ error: `Streaming failed: ${err.message}` }))
+        }
+      })
+    }
   }
 }

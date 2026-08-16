@@ -110,6 +110,77 @@ export default function App() {
     }
   }, [])
 
+  const convertUrl = useCallback(async (url: string) => {
+    if (!ffmpegRef.current) {
+      setJob((j) => ({ ...j, status: 'error', error: 'FFmpeg failed to load. Try refreshing.' }))
+      return
+    }
+
+    setJob({
+      status: 'loading',
+      progress: 0,
+      outputUrl: null,
+      outputName: null,
+      error: null,
+      inputName: 'Resolving video link...',
+      inputSize: null,
+    })
+
+    try {
+      const response = await fetch(`/api/yt-download?url=${encodeURIComponent(url)}`)
+      if (!response.ok) {
+        let errMsg = 'Failed to fetch video stream'
+        try {
+          const errJson = await response.json()
+          if (errJson && errJson.error) errMsg = errJson.error
+        } catch {}
+        throw new Error(errMsg)
+      }
+
+      // Parse filename from Content-Disposition
+      const contentDisposition = response.headers.get('content-disposition')
+      let filename = 'audio.mp4'
+      if (contentDisposition) {
+        const match = contentDisposition.match(/filename="?([^"]+)"?/)
+        if (match && match[1]) {
+          filename = decodeURIComponent(match[1])
+        }
+      }
+
+      const ext = filename.split('.').pop() ?? 'mp4'
+      const inputName = `input.${ext}`
+      const outputName = filename.replace(/\.[^.]+$/, '') + '.mp3'
+
+      setJob((j) => ({
+        ...j,
+        status: 'converting',
+        inputName: filename,
+        outputName,
+      }))
+
+      const blob = await response.blob()
+      const ffmpeg = ffmpegRef.current
+      await ffmpeg.writeFile(inputName, await fetchFile(blob))
+
+      setJob((j) => ({
+        ...j,
+        inputSize: formatBytes(blob.size),
+      }))
+
+      await ffmpeg.exec(['-i', inputName, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', 'output.mp3'])
+      const data = await ffmpeg.readFile('output.mp3')
+      const outBlob = new Blob([data], { type: 'audio/mpeg' })
+      const outUrl = URL.createObjectURL(outBlob)
+      await ffmpeg.deleteFile(inputName)
+      await ffmpeg.deleteFile('output.mp3')
+      setJob((j) => ({ ...j, status: 'done', progress: 100, outputUrl: outUrl, outputName }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'URL conversion failed'
+      setJob((j) => ({ ...j, status: 'error', error: msg }))
+    }
+  }, [])
+
+
   const handleFileDrop = useCallback((files: FileList | null) => {
     if (!files || files.length === 0) return
     const file = files[0]!
@@ -208,51 +279,9 @@ export default function App() {
             className="rounded-2xl overflow-hidden"
             style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)', backdropFilter: 'blur(20px)' }}
           >
-            {/* File mode */}
-            {mode === 'file' && (
+            {/* If a job is active, show the status layout */}
+            {job.status !== 'idle' ? (
               <div className="p-6 sm:p-8">
-                {job.status === 'idle' && (
-                  <div
-                    onDragEnter={onDragEnter}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDragLeave={onDragLeave}
-                    onDrop={onDrop}
-                    onClick={() => fileRef.current?.click()}
-                    className="relative flex flex-col items-center justify-center gap-5 rounded-xl cursor-pointer transition-all duration-300 py-16 px-6"
-                    style={{
-                      border: dragging ? '2px dashed #6366f1' : '2px dashed rgba(255,255,255,0.1)',
-                      background: dragging ? 'rgba(99,102,241,0.07)' : 'rgba(255,255,255,0.02)',
-                      boxShadow: dragging ? '0 0 30px rgba(99,102,241,0.15) inset' : 'none',
-                    }}
-                  >
-                    <div className="w-16 h-16 rounded-2xl flex items-center justify-center transition-all duration-300"
-                      style={{ background: dragging ? 'rgba(99,102,241,0.25)' : 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)' }}>
-                      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={dragging ? '#818cf8' : '#6366f1'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                        <polyline points="17 8 12 3 7 8" />
-                        <line x1="12" y1="3" x2="12" y2="15" />
-                      </svg>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-white font-semibold text-lg mb-1" style={{ fontFamily: 'Outfit, sans-serif' }}>
-                        {dragging ? 'Drop to convert' : 'Drag & drop your video'}
-                      </p>
-                      <p className="text-white/30 text-sm font-mono">
-                        or <span className="text-indigo-400 underline underline-offset-2">browse files</span>
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2 justify-center">
-                      {['.MP4', '.MOV', '.MKV', '.WEBM', '.AVI', '.FLV'].map((ext) => (
-                        <span key={ext} className="px-2 py-0.5 rounded text-[10px] font-mono text-white/40"
-                          style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                          {ext}
-                        </span>
-                      ))}
-                    </div>
-                    <input ref={fileRef} type="file" accept="video/*" className="hidden" onChange={(e) => handleFileDrop(e.target.files)} />
-                  </div>
-                )}
-
                 {isConverting && (
                   <div className="flex flex-col items-center gap-6 py-12">
                     <div className="relative w-20 h-20">
@@ -278,15 +307,19 @@ export default function App() {
                       </span>
                     </div>
                     <div className="text-center">
-                      <p className="text-white font-semibold mb-1" style={{ fontFamily: 'Outfit, sans-serif' }}>Converting…</p>
+                      <p className="text-white font-semibold mb-1" style={{ fontFamily: 'Outfit, sans-serif' }}>
+                        {job.status === 'loading' ? 'Resolving link…' : 'Converting…'}
+                      </p>
                       {job.inputName && (
                         <p className="text-white/30 text-xs font-mono truncate max-w-xs">{job.inputName}</p>
                       )}
                     </div>
-                    <div className="w-full max-w-xs h-px rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.07)' }}>
-                      <div className="h-full rounded-full transition-all duration-300"
-                        style={{ width: `${job.progress}%`, background: 'linear-gradient(90deg, #6366f1, #a78bfa)' }} />
-                    </div>
+                    {job.status !== 'loading' && (
+                      <div className="w-full max-w-xs h-px rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.07)' }}>
+                        <div className="h-full rounded-full transition-all duration-300"
+                          style={{ width: `${job.progress}%`, background: 'linear-gradient(90deg, #6366f1, #a78bfa)' }} />
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -351,84 +384,130 @@ export default function App() {
                   </div>
                 )}
               </div>
-            )}
-
-            {/* URL mode */}
-            {mode === 'url' && (
-              <div className="p-6 sm:p-8">
-                {/* YouTube notice */}
-                <div className="rounded-xl p-4 mb-6 flex gap-3"
-                  style={{ background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.18)' }}>
-                  <svg className="flex-shrink-0 mt-0.5" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                    <line x1="12" y1="9" x2="12" y2="13" />
-                    <line x1="12" y1="17" x2="12.01" y2="17" />
-                  </svg>
-                  <div>
-                    <p className="text-yellow-300/80 text-sm font-medium mb-1" style={{ fontFamily: 'Outfit, sans-serif' }}>Backend required for YouTube</p>
-                    <p className="text-yellow-400/50 text-xs font-mono leading-relaxed">
-                      Downloading from YouTube requires a server-side proxy due to CORS restrictions and platform policies. This UI is ready — connect a backend endpoint (e.g. yt-dlp) to enable it.
-                    </p>
+            ) : (
+              /* Otherwise, show input modes */
+              <>
+                {/* File uploader */}
+                {mode === 'file' && (
+                  <div className="p-6 sm:p-8">
+                    <div
+                      onDragEnter={onDragEnter}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDragLeave={onDragLeave}
+                      onDrop={onDrop}
+                      onClick={() => fileRef.current?.click()}
+                      className="relative flex flex-col items-center justify-center gap-5 rounded-xl cursor-pointer transition-all duration-300 py-16 px-6"
+                      style={{
+                        border: dragging ? '2px dashed #6366f1' : '2px dashed rgba(255,255,255,0.1)',
+                        background: dragging ? 'rgba(99,102,241,0.07)' : 'rgba(255,255,255,0.02)',
+                        boxShadow: dragging ? '0 0 30px rgba(99,102,241,0.15) inset' : 'none',
+                      }}
+                    >
+                      <div className="w-16 h-16 rounded-2xl flex items-center justify-center transition-all duration-300"
+                        style={{ background: dragging ? 'rgba(99,102,241,0.25)' : 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)' }}>
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={dragging ? '#818cf8' : '#6366f1'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                          <polyline points="17 8 12 3 7 8" />
+                          <line x1="12" y1="3" x2="12" y2="15" />
+                        </svg>
+                      </div>
+                      <div className="text-center">
+                        <p className="text-white font-semibold text-lg mb-1" style={{ fontFamily: 'Outfit, sans-serif' }}>
+                          {dragging ? 'Drop to convert' : 'Drag & drop your video'}
+                        </p>
+                        <p className="text-white/30 text-sm font-mono">
+                          or <span className="text-indigo-400 underline underline-offset-2">browse files</span>
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2 justify-center">
+                        {['.MP4', '.MOV', '.MKV', '.WEBM', '.AVI', '.FLV'].map((ext) => (
+                          <span key={ext} className="px-2 py-0.5 rounded text-[10px] font-mono text-white/40"
+                            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                            {ext}
+                          </span>
+                        ))}
+                      </div>
+                      <input ref={fileRef} type="file" accept="video/*" className="hidden" onChange={(e) => handleFileDrop(e.target.files)} />
+                    </div>
                   </div>
-                </div>
+                )}
 
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-xs font-mono text-white/40 mb-2 tracking-wider uppercase">Video URL</label>
-                    <div className="flex gap-3">
-                      <div className="flex-1 relative">
-                        <input
-                          type="url"
-                          value={ytUrl}
-                          onChange={(e) => setYtUrl(e.target.value)}
-                          placeholder="https://youtube.com/watch?v=... or any direct video URL"
-                          className="w-full px-4 py-3 rounded-xl text-sm text-white placeholder-white/20 outline-none transition-all duration-200 font-mono"
-                          style={{
-                            background: 'rgba(255,255,255,0.05)',
-                            border: '1px solid rgba(255,255,255,0.1)',
-                          }}
-                          onFocus={(e) => (e.currentTarget.style.borderColor = 'rgba(99,102,241,0.5)')}
-                          onBlur={(e) => (e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)')}
-                        />
-                        {isYouTubeUrl(ytUrl) && (
-                          <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="#ff0000">
-                              <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
-                            </svg>
+                {/* URL mode */}
+                {mode === 'url' && (
+                  <div className="p-6 sm:p-8">
+                    {/* Status notice */}
+                    <div className="rounded-xl p-4 mb-6 flex gap-3"
+                      style={{ background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.18)' }}>
+                      <svg className="flex-shrink-0 mt-0.5" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="12" y1="16" x2="12" y2="12" />
+                        <line x1="12" y1="8" x2="12.01" y2="8" />
+                      </svg>
+                      <div>
+                        <p className="text-indigo-300 text-sm font-medium mb-1" style={{ fontFamily: 'Outfit, sans-serif' }}>Local Proxy Active</p>
+                        <p className="text-white/40 text-xs font-mono leading-relaxed">
+                          Your input URL is processed securely through a local proxy and converted directly in your browser using WebAssembly.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-xs font-mono text-white/40 mb-2 tracking-wider uppercase">Video URL</label>
+                        <div className="flex gap-3">
+                          <div className="flex-1 relative">
+                            <input
+                              type="url"
+                              value={ytUrl}
+                              onChange={(e) => setYtUrl(e.target.value)}
+                              placeholder="https://youtube.com/watch?v=... or any direct video URL"
+                              className="w-full px-4 py-3 rounded-xl text-sm text-white placeholder-white/20 outline-none transition-all duration-200 font-mono"
+                              style={{
+                                background: 'rgba(255,255,255,0.05)',
+                                border: '1px solid rgba(255,255,255,0.1)',
+                              }}
+                              onFocus={(e) => (e.currentTarget.style.borderColor = 'rgba(99,102,241,0.5)')}
+                              onBlur={(e) => (e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)')}
+                            />
+                            {isYouTubeUrl(ytUrl) && (
+                              <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="#ff0000">
+                                  <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+                                </svg>
+                              </div>
+                            )}
                           </div>
-                        )}
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => convertUrl(ytUrl)}
+                        disabled={!ytUrl.trim()}
+                        className="w-full py-3.5 rounded-xl font-semibold text-sm cursor-pointer transition-all duration-200 hover:opacity-90 active:scale-98 disabled:cursor-not-allowed disabled:opacity-50"
+                        style={{
+                          background: 'linear-gradient(135deg, #6366f1, #7c3aed)',
+                          color: '#fff',
+                          boxShadow: ytUrl.trim() ? '0 0 20px rgba(99,102,241,0.4)' : 'none',
+                        }}
+                      >
+                        Convert to MP3
+                      </button>
+
+                      <div className="rounded-xl p-4" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                        <p className="text-xs font-mono text-white/30 mb-3 uppercase tracking-wider">Supported Platforms</p>
+                        <div className="flex flex-wrap gap-x-4 gap-y-2">
+                          {['YouTube', 'TikTok', 'Instagram', 'Twitter/X', 'SoundCloud', 'Vimeo', 'Reddit'].map((platform) => (
+                            <div key={platform} className="flex items-center gap-1.5">
+                              <span className="w-1 h-1 rounded-full bg-emerald-400" />
+                              <span className="text-xs font-mono text-white/50">{platform}</span>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     </div>
                   </div>
-
-                  <button
-                    disabled
-                    className="w-full py-3.5 rounded-xl font-semibold text-sm cursor-not-allowed"
-                    style={{ background: 'rgba(99,102,241,0.15)', color: 'rgba(165,180,252,0.5)', border: '1px solid rgba(99,102,241,0.2)' }}
-                  >
-                    Convert to MP3 — Backend Required
-                  </button>
-
-                  <div className="rounded-xl p-4" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)' }}>
-                    <p className="text-xs font-mono text-white/30 mb-3 uppercase tracking-wider">To enable YouTube support, connect a backend like:</p>
-                    <div className="space-y-2">
-                      {[
-                        { name: 'yt-dlp', desc: 'Open-source CLI — best coverage' },
-                        { name: 'youtube-dl', desc: 'Classic downloader' },
-                        { name: 'RapidAPI YT', desc: 'SaaS API, ready to use' },
-                      ].map((opt) => (
-                        <div key={opt.name} className="flex items-center gap-3">
-                          <span className="w-1.5 h-1.5 rounded-full bg-indigo-500/50 flex-shrink-0" />
-                          <span className="text-xs font-mono text-white/50">
-                            <span className="text-indigo-400">{opt.name}</span>
-                            <span className="text-white/25"> — {opt.desc}</span>
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
+                )}
+              </>
             )}
           </div>
 
