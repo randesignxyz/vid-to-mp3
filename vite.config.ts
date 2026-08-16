@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 import { Readable } from 'node:stream'
+import ytdl from '@distube/ytdl-core'
 
 import siteConfiguration from './.figma/make/site.json'
 
@@ -363,15 +364,9 @@ function figmaMakeKitPlugin(options: { storiesGlob: string | string[] }): Plugin
 
 /**
  * Custom local proxy server plugin to handle YouTube/URL audio extraction.
- * Proxies requests to a public Cobalt instance and streams the response back.
+ * Uses @distube/ytdl-core for YouTube links, and proxies direct links.
  */
 function figmaYoutubeDownloadPlugin(): Plugin {
-  const COBALT_INSTANCES = [
-    'https://api.cobalt.tools/',
-    'https://cobalt.api.ry.hu/',
-    'https://co.wuk.sh/'
-  ]
-
   return {
     name: 'figma-youtube-download',
     apply: 'serve',
@@ -390,82 +385,69 @@ function figmaYoutubeDownloadPlugin(): Plugin {
           return
         }
 
-        console.log(`[Proxy] Resolving YouTube URL: ${targetUrl}`)
-
-        let downloadUrl = ''
-        let originalFilename = ''
-        let resolveError = ''
-
-        // Try instances in sequence
-        for (const instance of COBALT_INSTANCES) {
-          try {
-            const apiRes = await fetch(instance, {
-              method: 'POST',
-              headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                url: targetUrl,
-                downloadMode: 'audio',
-                audioFormat: 'mp3',
-                filenamePattern: 'pretty'
-              })
-            })
-
-            if (!apiRes.ok) {
-              throw new Error(`Instance returned status ${apiRes.status}`)
-            }
-
-            const json = await apiRes.json() as any
-            if (json && json.url) {
-              downloadUrl = json.url
-              originalFilename = json.filename || 'audio.mp3'
-              break
-            } else {
-              throw new Error('Instance returned invalid response structure')
-            }
-          } catch (err: any) {
-            console.warn(`[Proxy] Instance ${instance} failed: ${err.message}`)
-            resolveError = err.message
-          }
-        }
-
-        if (!downloadUrl) {
-          res.statusCode = 502
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: `Failed to resolve video stream: ${resolveError}` }))
-          return
-        }
-
-        console.log(`[Proxy] Resolved stream URL: ${downloadUrl}`)
-        console.log(`[Proxy] Streaming file: ${originalFilename}`)
+        console.log(`[Proxy] Resolving URL: ${targetUrl}`)
 
         try {
-          const streamRes = await fetch(downloadUrl)
-          if (!streamRes.ok) {
-            throw new Error(`Failed to fetch file stream: status ${streamRes.status}`)
-          }
+          // If it's a YouTube URL, use @distube/ytdl-core
+          if (ytdl.validateURL(targetUrl)) {
+            console.log('[Proxy] Detected YouTube link, using @distube/ytdl-core')
+            const info = await ytdl.getInfo(targetUrl)
+            const title = info.videoDetails.title || 'audio'
+            
+            // Clean title for header (remove non-ASCII to prevent Content-Disposition issues)
+            const safeTitle = title.replace(/[^\x20-\x7E]/g, '') || 'audio'
 
-          // Forward content type and content disposition
-          res.statusCode = 200
-          res.setHeader('Content-Type', streamRes.headers.get('content-type') || 'audio/mpeg')
-          res.setHeader(
-            'Content-Disposition',
-            `attachment; filename="${encodeURIComponent(originalFilename)}"`
-          )
+            console.log(`[Proxy] YouTube Video Title: ${title}`)
+            
+            res.statusCode = 200
+            res.setHeader('Content-Type', 'audio/mp4')
+            res.setHeader(
+              'Content-Disposition',
+              `attachment; filename="${encodeURIComponent(safeTitle)}.mp4"`
+            )
 
-          const body = streamRes.body
-          if (body) {
-            Readable.fromWeb(body as any).pipe(res)
+            const stream = ytdl(targetUrl, {
+              filter: 'audioonly',
+              quality: 'highestaudio',
+            })
+
+            stream.on('error', (err: any) => {
+              console.error(`[Proxy] ytdl stream error: ${err.message}`)
+            })
+
+            stream.pipe(res)
           } else {
-            res.statusCode = 500
-            res.end(JSON.stringify({ error: 'No stream body available' }))
+            // Treat as direct video/audio stream URL
+            console.log(`[Proxy] Detected direct URL, fetching stream directly: ${targetUrl}`)
+            const streamRes = await fetch(targetUrl)
+            if (!streamRes.ok) {
+              throw new Error(`Failed to fetch direct media stream: status ${streamRes.status}`)
+            }
+
+            res.statusCode = 200
+            res.setHeader('Content-Type', streamRes.headers.get('content-type') || 'video/mp4')
+            const contentDisp = streamRes.headers.get('content-disposition')
+            if (contentDisp) {
+              res.setHeader('Content-Disposition', contentDisp)
+            } else {
+              // Extract filename from URL path if possible
+              const urlPathName = new URL(targetUrl).pathname
+              const baseName = urlPathName.split('/').pop() || 'video.mp4'
+              res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}"`)
+            }
+
+            const body = streamRes.body
+            if (body) {
+              Readable.fromWeb(body as any).pipe(res)
+            } else {
+              throw new Error('No stream body available')
+            }
           }
         } catch (err: any) {
-          console.error(`[Proxy] Error streaming file: ${err.message}`)
+          console.error(`[Proxy] Error resolving stream: ${err.message}`)
           res.statusCode = 500
-          res.end(JSON.stringify({ error: `Streaming failed: ${err.message}` }))
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: `Failed to resolve video stream: ${err.message}` }))
         }
       })
     }

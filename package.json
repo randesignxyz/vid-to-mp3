@@ -10,6 +10,7 @@
     "format": "oxfmt"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^4.15.9",
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "react": "^19.0.0",
